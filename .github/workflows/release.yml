@@ -1,130 +1,168 @@
-name: Release to Aliyun CR
+name: Release amd64 to GHCR
 
 on:
-  workflow_dispatch:
-    inputs:
-      version_type:
-        description: '版本类型'
-        required: true
-        default: 'patch'
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+  push:
+    branches:
+      - main
 
 permissions:
   contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.26.x"
+  NODE_VERSION: "24"
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get current version
-        id: get_version
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Compute next version
+        id: version
+        shell: bash
         run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          TAG_VERSION=${LATEST_TAG#v}
-
-          if [ -f VERSION ]; then
-            FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          set -euo pipefail
+          latest_tag="$(git tag -l 'v*' --sort=-version:refname | head -n1 || true)"
+          if [ -z "${latest_tag}" ]; then
+            base="0.1.0"
           else
-            FILE_VERSION="0.0.0"
+            base="${latest_tag#v}"
           fi
 
-          function version_gt() { test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"; }
+          IFS='.' read -r major minor patch <<< "${base}"
+          major="${major:-0}"
+          minor="${minor:-1}"
+          patch="${patch:-0}"
+          next_patch="$((patch + 1))"
 
-          if version_gt "$FILE_VERSION" "$TAG_VERSION"; then
-            VERSION="$FILE_VERSION"
-          else
-            VERSION="$TAG_VERSION"
-          fi
+          new_version="${major}.${minor}.${next_patch}"
+          new_tag="v${new_version}"
 
-          echo "Current version: $VERSION"
-          echo "current_version=$VERSION" >> $GITHUB_OUTPUT
+          echo "new_version=${new_version}" >> "$GITHUB_OUTPUT"
+          echo "new_tag=${new_tag}" >> "$GITHUB_OUTPUT"
 
-      - name: Calculate next version
-        id: next_version
+      - name: Update VERSION
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${{ steps.version.outputs.new_version }}" > VERSION
+
+      - name: Build WebUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix webui --prefer-offline --no-audit
+          npm run build --prefix webui
+
+      - name: Build linux amd64 archive only
+        shell: bash
         env:
-          VERSION_TYPE: ${{ github.event.inputs.version_type }}
+          RELEASE_TAG: ${{ steps.version.outputs.new_tag }}
+          BUILD_VERSION: ${{ steps.version.outputs.new_tag }}
         run: |
-          VERSION="${{ steps.get_version.outputs.current_version }}"
-          BASE_VERSION=$(echo "$VERSION" | sed 's/-.*$//')
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          ./scripts/build-release-archives.sh
 
-          IFS='.' read -r -a version_parts <<< "$BASE_VERSION"
-          MAJOR="${version_parts[0]:-0}"
-          MINOR="${version_parts[1]:-0}"
-          PATCH="${version_parts[2]:-0}"
-
-          case "$VERSION_TYPE" in
-            major)
-              NEW_VERSION="$((MAJOR + 1)).0.0"
-              ;;
-            minor)
-              NEW_VERSION="${MAJOR}.$((MINOR + 1)).0"
-              ;;
-            *)
-              NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
-              ;;
-          esac
-
-          echo "New version: $NEW_VERSION"
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "new_tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
-
-      - name: Update VERSION file
+      - name: Generate checksums
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.new_tag }}
         run: |
-          echo "${{ steps.next_version.outputs.new_version }}" > VERSION
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          (cd dist && sha256sum "ds2api_${TAG}_linux_amd64.tar.gz" > sha256sums.txt)
 
-      - name: Commit VERSION and create tag
+      - name: Prepare Docker dist input
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.new_tag }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          mkdir -p dist/docker-input
+          cp "dist/ds2api_${TAG}_linux_amd64.tar.gz" "dist/docker-input/linux_amd64.tar.gz"
 
-          git add VERSION
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: bump version to ${{ steps.next_version.outputs.new_tag }} [skip ci]"
-          fi
-
-          NEW_TAG="${{ steps.next_version.outputs.new_tag }}"
-          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
-          git push origin HEAD:main "$NEW_TAG"
-
-      # Docker 构建并推送到阿里云
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Aliyun Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.ALIYUN_REGISTRY }}
-          username: ${{ secrets.ALIYUN_REGISTRY_USER }}
-          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and push linux amd64 image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          target: runtime-from-dist
           push: true
+          platforms: linux/amd64
           tags: |
-            ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_REGISTRY_NAMESPACE }}/ds2api:${{ steps.next_version.outputs.new_tag }}
-            ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_REGISTRY_NAMESPACE }}/ds2api:${{ steps.next_version.outputs.new_version }}
-            ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_REGISTRY_NAMESPACE }}/ds2api:latest
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.new_tag }}
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.new_version }}
+            ghcr.io/${{ github.repository }}:latest
           labels: |
-            org.opencontainers.image.version=${{ steps.next_version.outputs.new_version }}
+            org.opencontainers.image.version=${{ steps.version.outputs.new_version }}
             org.opencontainers.image.revision=${{ github.sha }}
-          build-args: |
-            BUILD_VERSION=${{ steps.next_version.outputs.new_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Commit VERSION and create tag
+        shell: bash
+        env:
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add VERSION
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: release ${NEW_TAG} [skip ci]"
+          fi
+
+          git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}"
+          git push origin HEAD:${GITHUB_REF_NAME} "${NEW_TAG}"
+
+      - name: Create GitHub release and upload assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "${NEW_TAG}" \
+            "dist/ds2api_${NEW_TAG}_linux_amd64.tar.gz" \
+            "dist/sha256sums.txt" \
+            --title "${NEW_TAG}" \
+            --notes "Automated release ${NEW_TAG}"
